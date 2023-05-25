@@ -7,7 +7,7 @@ output:
         toc_float: true
         number_sections: true
 params:
-  pathtofiles: "/Volumes/projects/Engström/Insulin Project/2022-02-10 Sequencing of NR-1 and NR-7/Salmon Quantification Files"
+  pathtofiles: "/path/to/quantfiles/Salmon Quantification Files"
   results: "output/"
   transcriptionfactors: "metadata/GOterm_TF.xlsx"
 ---
