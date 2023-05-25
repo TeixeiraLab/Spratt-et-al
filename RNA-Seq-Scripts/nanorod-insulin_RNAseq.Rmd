@@ -1,0 +1,365 @@
+---
+title: "NR-insulin treated adipocyte RNA-seq"
+author: "Enya Engström"
+output:
+    html_document:
+        toc: true
+        toc_float: true
+        number_sections: true
+params:
+  pathtofiles: "/Volumes/projects/Engström/Insulin Project/2022-02-10 Sequencing of NR-1 and NR-7/Salmon Quantification Files"
+  results: "output/"
+  transcriptionfactors: "metadata/GOterm_TF.xlsx"
+---
+# Set-up
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center")
+```
+## Load Packages
+```{r Libraries, include=FALSE, message=FALSE}
+library(DESeq2)
+library(readxl)
+library(data.table)
+library(ggplot2)
+library(ggfortify)
+library(ComplexHeatmap)
+library(clusterProfiler) # aquired from devtools::install_github("YuLab-SMU/clusterProfiler")
+library(circlize)
+library(RColorBrewer)
+library(org.Mm.eg.db)
+library(ggnewscale)
+library(tximport)
+library(svglite)
+library(writexl)
+```
+## Define Functions
+```{r Functions, include=FALSE, message=FALSE}
+# Run DESeq analysis for all samples individually 
+resCondition <- function(dds, sample){
+  sample <- paste(sample)
+  
+  res <- as.data.table(as.data.frame(results(dds, contrast = c("condition", sample, "Ctrl"))), keep.rownames = T)
+  res$diffExpressed <- "NO"
+  res$diffExpressed[res$log2FoldChange > 0.58 & res$padj < 0.001] <- "UP"
+  res$diffExpressed[res$log2FoldChange < - 0.58 & res$padj < 0.001] <- "DOWN"
+  DE <- res[res$diffExpressed != "NO"]
+  colnames(DE)[1] <- "Symbol"
+  res.list <- list(res, DE)
+  return(res.list)
+}
+
+# Find transcription factors among DE genes
+findTF <- function(sample){
+  common.tf <- intersect(transcription.genename, sample$Symbol)
+  de.transcription <- sample[sample$Symbol %in% common.tf]
+  de.transcription.info <- transcription.genes[transcription.genes$Symbol %in% common.tf,]
+  de.transcription.info <- de.transcription.info[!duplicated(de.transcription.info$Symbol),]
+  de.tf <- cbind(de.transcription, de.transcription.info)
+  
+  return(de.tf)
+}
+
+# Create ranked list from GSEA of GO-Terms
+rankedList <- function(res){
+  ranked.list <- res$log2FoldChange
+  names(ranked.list) <- res$rn
+  ranked.list <- na.omit(ranked.list)
+  sorted.ranked.list <- sort(ranked.list, decreasing = TRUE)
+  return(sorted.ranked.list)
+}
+
+# Merge GSEA Results
+combineGsea <- function(gsea.list,number.of.pathways){
+  # Create combined+reduced list
+  gsea <- rbindlist(l = gsea.list, idcol = TRUE)
+  names(gsea)[1] <- "Condition"
+  
+  # Only keep pathways occurring in X conditions
+  pathways.freq <- as.data.frame(table(gsea$Description))
+  common.pathways <- pathways.freq[pathways.freq$Freq <= number.of.pathways,]
+  common.gsea <- gsea[gsea$Description %in% common.pathways$Var1]
+  
+  # Include -log(FDR) p-values
+  common.gsea$logFDR <- -log10(common.gsea$p.adjust)
+  
+  return(common.gsea)
+}
+
+# Generate ranked list of GSEA of KEGG-pathways
+rankedKegg <- function(res, rankedlist){
+  ids = bitr(names(rankedlist), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+  dedup.ids = ids[!duplicated(ids[c("SYMBOL")]),]
+  colnames(dedup.ids) = c("rn", "EntrezID")
+  df = merge(res, dedup.ids, by = "rn")
+  
+  
+  kegg.gene.list = df$log2FoldChange    # Create a vector of the gene universe
+  names(kegg.gene.list) = df$EntrezID   # Name vector with ENTREZ ids
+  kegg.gene.list = na.omit(kegg.gene.list)  # omit any NA values
+  kegg.gene.list = sort(kegg.gene.list, decreasing = TRUE)  # sort the list in decreasing order (required for clusterProfiler)
+  
+  return(kegg.gene.list)
+}
+
+```
+
+## Set Seed
+```{r Seed, include=FALSE, message=FALSE}
+set.seed(123)
+```
+
+# Aquire Files from Salmon Quantification and Reference Transcriptome
+
+The path to the folder containing Salmon Quantification Files is specified in params (pathtofiles).
+Reference genome is acquired from FTP Protein Data Bank (vM25 mmu transcriptome). 
+
+```{r files, include=FALSE, message=FALSE}
+# Import Files from Salmon Quantification (qunt.sf files)
+fls <- list.files(path = params$pathtofiles, pattern = "quant.sf", full.names = TRUE, recursive = TRUE)
+index = 8 # Change depending on where the sample name folder is in the path
+names(fls) <- sapply(strsplit(fls, "/"), "[[", index)
+
+# Load reference 
+t2g <- fread("https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.metadata.MGI.gz", header = F)
+
+# Import quantification and link to gene ID
+txi <- tximport(fls, type = "salmon", tx2gene = t2g[,1:2], ignoreAfterBar = TRUE)
+```
+
+# Construct Metadata file
+
+Constructing metadata file for" the samples containing info about sample (full name of sample), experiment (any chosen name), condition, time, and replicate. We also change the "-" in the condition to "." and relevel the metadata so that the control is set to "Ctrl" condition.
+
+```{r metadata, include=FALSE}
+meta <- data.table(sample=names(fls))
+meta[, c("experiment", "condition", "time", "replicate") := tstrsplit(sample, "_")]
+meta[, condition := factor(gsub("-", ".", condition, fixed = T))] 
+meta[, condition := relevel(condition, ref="Ctrl")]
+```
+
+# DESeq2: LRT test
+
+Perform DE-analysis using the Likelihood ratio test (LRT). This data will be used for generating heatmap and comparison of DE-genes in the overall dataset. Genes are considered DE if they have an adjusted p-value < 0.001 and -0.58 < log2FC > 0.58.
+
+```{r DESeq LRT, include=FALSE, message=FALSE}
+dds.lrt <- DESeqDataSetFromTximport(txi, meta, design = ~condition) 
+dds.lrt <- DESeq(dds.lrt, test = "LRT", reduced = ~1) 
+res.lrt <- as.data.table(as.data.frame(results(dds.lrt)), keep.rownames = T)
+res.lrt$diffExpressed <- "NO"
+res.lrt$diffExpressed[res.lrt$log2FoldChange > 0.58 & res.lrt$padj < 1e-3] <- "UP"
+res.lrt$diffExpressed[res.lrt$log2FoldChange < -0.58 & res.lrt$padj < 1e-3] <- "DOWN"
+de.lrt <- res.lrt[res.lrt$diffExpressed != "NO"]
+colnames(res.lrt)[1] <- "Symbol"
+colnames(de.lrt)[1] <- "Symbol"
+
+samples <- c(meta$condition[15], meta$condition[13],meta$condition[10],meta$condition[7],meta$condition[4])
+all.dds.lrt <- lapply(samples, resCondition, dds=dds.lrt)
+names(all.dds.lrt) <- c("NR7.10", "NR7.100", "NR1.10", "Ins.10", "Ins.100")
+all.res.lrt <- lapply(all.dds.lrt, "[[", 1)
+all.de.lrt <- lapply(all.dds.lrt, "[[", 2)
+
+write_xlsx(all.de.lrt, path= paste(params$results,"LRT_DEGs.xlsx", sep=""))
+
+```
+
+## QC Plots
+
+```{r QC, echo=FALSE}
+
+plotDispEsts(dds.lrt)
+plotMA(results(dds.lrt))
+
+# PCA plot
+normalized.counts = counts(dds.lrt, normalized = T)
+pca.input <- normalized.counts[rowSums(normalized.counts[])>0,]
+pca <- prcomp(t(pca.input), scale. = TRUE)
+autoplot(pca, data = meta, colour = "condition") + scale_color_brewer(palette="Paired", direction = -1) + cowplot::theme_cowplot()
+
+```
+
+## Plot Heatmap from DESeq LRT analysis
+
+Generate a heatmap using the package ComplexHeatmap for all genes with adjusted p-value < 0.001. 
+Annotate rows with a selection of DE-genes. 
+
+```{r Generate Heatmap, include=FALSE}
+normalized.counts = counts(dds.lrt, normalized = T)
+mat <- normalized.counts[res.lrt[padj < 1e-3, Symbol],]
+
+colname.genes <- c("Akt2", "Foxo1", "Foxo3", "Foxo4", "Adipoq", "Pnpla2", "Scd2", "Srebf1", "Fasn", "Acly", "Acaca", "Plin1", "Slc2a4", "Gsk3b",
+              "Pik3r3", "Adipor1", "Elovl3", "Dgat", "Gpd1", "Cidec", "Hk1", "Hk2", "Ptprf", "Pik3r1", "Zfp106", "Insr", "Igf1r", "Irs2",
+              "Ces1d", "Pnpla3", "Lep", "Enpp1")
+index = which(rownames(mat) %in% colname.genes)
+rha <- rowAnnotation(gene = anno_mark(at = index, labels = rownames(mat)[index]),simple_anno_size = unit(2, "mm"))
+
+ncol <- 6 # number of conditions for colors 
+cha <- HeatmapAnnotation(Condition = sapply(strsplit(colnames(mat), "_"), "[[", 2), 
+                         col = list(Condition = setNames(brewer.pal(ncol, "Paired"), 
+                                        meta[rev(order(sample)), unique(gsub(".","-",condition, fixed = T))])))
+
+col.order <- c(1,2,3,6,7,8,4,5,9,10,11,14,15,16,12,13) # Change to plot columns in a specific order
+
+HM <- Heatmap(
+  matrix = t(apply(mat, 1, scale)),
+  col = colorRamp2(seq(-2,2, length.out = 11), rev(brewer.pal(11, "RdBu"))),
+  right_annotation = rha,
+  top_annotation = cha,
+  name = "Z-score", 
+  border = "black",
+  column_order = col.order,
+  show_row_names = F,
+  show_row_dend = F,
+  use_raster = F
+  )
+
+```
+
+```{r Plot Heatmap, echo=FALSE}
+HM
+```
+```{r Save Heatmap, include=FALSE, fig.height=10}
+pdf(file=paste(params$results,"HeatmapLRT.pdf", sep=""))
+HM
+dev.off()
+
+svglite(filename=paste(params$results,"HeatmapLRT.svg", sep=""))
+HM
+dev.off()
+```
+
+# DESeq2: Wald Test
+For Gene Set Enrichment Analysis (GSEA) of GO-Terms and KEGG pathways we use Wald Test instead, in order to render sample specific p-values. Genes are considered DE if they have an adjusted p-value < 0.001 and -0.58 < log2FC > 0.58. 
+
+```{r DESeq Wald, include=FALSE, message=FALSE}
+dds.wald <- DESeqDataSetFromTximport(txi, meta, design = ~condition) 
+dds.wald <- DESeq(dds.wald)
+
+# SECOND ROUND OF SEQUENCING - NR SAMPLES
+samples <- c(meta$condition[15], meta$condition[13],meta$condition[10],meta$condition[7],meta$condition[4])
+
+all.dds.wald <- lapply(samples, resCondition, dds=dds.wald)
+names(all.dds.wald) <- c("NR7.10", "NR7.100", "NR1.10", "Ins.10", "Ins.100")
+res.wald <- lapply(all.dds.wald, "[[", 1)
+de.wald <- lapply(all.dds.wald, "[[", 2)
+
+# Due to lack of DE genes Ins 10 nM is excluded from further analysis
+res.wald$Ins.10 <- NULL
+de.wald$Ins.10 <- NULL
+
+```
+
+## UpSet Plot of DE Genes
+
+```{r UpSet Plot, echo=FALSE}
+
+up.set.input <- list("Insulin 100nM" = de.wald$Ins.100$Symbol,
+                  "NR-7 10nM" = de.wald$NR7.10$Symbol,
+                  "NR-7 100nM" = de.wald$NR7.100$Symbol,
+                  "NR-1 10nM" = de.wald$NR1.10$Symbol)
+a <- make_comb_mat(up.set.input, mode = "intersect")
+
+UpSet(a, comb_order = order(comb_size(a), decreasing = TRUE))
+
+```
+
+## Find Sample Specific Transcription Factors 
+
+Finding transcription factors that are DE for each sample, using a list of transcription factor annotated genes from MGI (https://www.informatics.jax.org/vocab/gene_ontology/GO:0003700) 
+
+```{r WaldTF, include=FALSE, message=FALSE}
+
+transcription.genes <- read_excel(params$transcriptionfactors)
+transcription.genename <- unique(transcription.genes$Symbol)
+
+tf <- lapply(de.wald,findTF)
+write_xlsx(tf, path=paste(params$results,"TF_DEGs.xlsx", sep=""))
+
+```
+
+## GSEA of GO-Terms
+
+We used a ranked list of the DESeq2 Wald test for GSEA of GO-Terms, and use the function gseGO from clusterprofiler. Adjusted p-value cutoff is set to 0.1 using FDR adjustment.
+Insulin 10 nM and NR-1 10 nM did not yield any significant GO-Terms with current p-value cutoff and are thus not included in the plot. 
+
+```{r GO-Terms, include=FALSE, message=FALSE}
+ranked.list <- lapply(res.wald, rankedList)
+gsea.goterm <- lapply(ranked.list, gseGO, 
+                      ont ="BP", 
+                      keyType = "SYMBOL", 
+                      minGSSize = 3, 
+                      maxGSSize = 800, 
+                      pvalueCutoff = 0.1, 
+                      OrgDb = org.Mm.eg.db, 
+                      pAdjustMethod = "fdr",
+                      nPermSimple = 10000)
+
+gsea.goterm.results <- lapply(gsea.goterm, function(x) as.data.table(x@result))
+
+```
+
+```{r Plot GO-Term, echo=FALSE, fig.height=10}
+gsea.goterm.plot <- list("NR7.10" = gsea.goterm.results$NR7.10, "NR7.100" = gsea.goterm.results$NR7.100, "Ins.100" = gsea.goterm.results$Ins.100)
+
+gsea <- combineGsea(gsea.goterm.plot,3)
+gsea <- gsea[order(-NES),]
+gsea.plot <- gsea[1:110,] # change depending on which to plot
+hm.go <- ggplot(gsea.plot, aes(x= factor(Condition, levels = c("Ins.100", "NR7.10", "NR7.100")), 
+                       y=reorder(Description,NES,mean), 
+                       group= factor(Condition, levels = c("Ins.100", "NR7.10", "NR7.100")))) + 
+  geom_tile(aes(fill = gsea.plot$NES)) +
+  scale_fill_distiller(palette = "RdBu", limits=c(min(gsea$NES),max(gsea$NES))) +
+  ylab("Pathway") + xlab("Condition") + labs(fill ="NES") +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  theme_classic()
+
+hm.go
+ggsave(filename = paste(params$results, "GSEA_GO-Terms.pdf", sep=""), plot=hm.go)
+write_xlsx(gsea.goterm.plot, path=paste(params$results, "GSEA_GO-Terms.xlsx", sep=""))
+
+```
+
+## GSEA KEGG-pathways 
+
+```{r GSEA KEGG, include=FALSE, message=FALSE}
+ranked.kegg.NR7.10 <- rankedKegg(res.wald$NR7.10, ranked.list$NR7.10)
+ranked.kegg.NR7.100 <- rankedKegg(res.wald$NR7.100, ranked.list$NR7.100)
+ranked.kegg.NR1.10 <- rankedKegg(res.wald$NR1.10, ranked.list$NR1.10)
+ranked.kegg.Ins.100 <- rankedKegg(res.wald$Ins.100, ranked.list$Ins.100)
+ranked.kegg <- list("NR7.10" = ranked.kegg.NR7.10, "NR7.100" = ranked.kegg.NR7.100, "NR1.10"=ranked.kegg.NR1.10, "Ins.100"=ranked.kegg.Ins.100)
+
+gse.kegg <- lapply(ranked.kegg, gseKEGG, 
+                   organism = "mmu",
+                   minGSSize    = 3,
+                   maxGSSize    = 800,
+                   pvalueCutoff = 0.05,
+                   pAdjustMethod = "fdr",
+                   keyType = "ncbi-geneid",
+                   seed=TRUE)
+
+gsea.kegg <- lapply(gse.kegg, function(x){setReadable(x, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")@result})
+
+gsea.kegg.all <- rbindlist(l = list("NR7.10" = gsea.kegg$NR7.10, "NR7.100" = gsea.kegg$NR7.100, "NR1.10" = gsea.kegg$NR1.10), idcol = TRUE)
+names(gsea.kegg.all)[1] <- "Condition"
+
+KDP <- ggplot(gsea.kegg.all, aes(x= factor(Condition, levels = c("NR7.10", "NR7.100", "NR1.10")), 
+                             y=reorder(Description,NES,mean), 
+                             size=-log10(p.adjust), 
+                             color=NES, 
+                             group= factor(Condition, levels = c("NR7.10", "NR7.100", "NR1.10")))) + 
+  geom_point(alpha = 0.9) +
+  scale_colour_distiller(palette = "RdBu", limits=c(min(gsea.kegg.all$NES),max(gsea.kegg.all$NES))) +
+  ylab("Pathway") + xlab("Condition") + labs(size = '-log FDR') +
+  theme_classic()
+
+KDP
+ggsave(filename=paste(params$results, "GSEA_KEGG.pdf", sep=""), plot=KDP)
+ggsave(filename=paste(params$results, "GSEA_KEGG.svg", sep=""), plot=KDP)
+write_xlsx(gsea.kegg, path=paste(params$results, "GSEA_KEGG.xlsx", sep=""))
+
+```
+
+# Save R-Data
+```{r SaveData, include=FALSE, message=FALSE}
+save.image(file = paste(params$results, "nanorod-ins.RData", sep=""))
+```
+
